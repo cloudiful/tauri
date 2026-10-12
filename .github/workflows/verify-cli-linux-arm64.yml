@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - ci/68-linux-arm64
+      - ci/68-linux-arm64-app
 
 permissions:
   contents: read
@@ -173,4 +173,76 @@ jobs:
             artifacts/**/*.tgz
             smoke/**/*.txt
             smoke/**/*.log
+          if-no-files-found: warn
+
+  application:
+    name: build app using ${{ matrix.cli_target }} CLI
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        cli_target:
+          - aarch64-unknown-linux-gnu
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Install desktop build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            binutils \
+            file \
+            dpkg
+
+      - name: Download matching CLI archive
+        uses: actions/download-artifact@v4
+        with:
+          name: cargo-tauri-${{ matrix.cli_target }}
+          path: ${{ runner.temp }}/cli-artifacts/${{ matrix.cli_target }}
+
+      - name: Extract packaged CLI
+        id: extract-cli
+        env:
+          CLI_TARGET: ${{ matrix.cli_target }}
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/cli-artifacts/$CLI_TARGET/cargo-tauri-$CLI_TARGET.tgz"
+          extract_dir="$RUNNER_TEMP/cli/$CLI_TARGET"
+          test -f "$archive"
+          mkdir -p "$extract_dir"
+          tar -xzf "$archive" -C "$extract_dir"
+          cli_path="$(realpath "$extract_dir/cargo-tauri")"
+          test -x "$cli_path"
+          printf 'path=%s\n' "$cli_path" >> "$GITHUB_OUTPUT"
+
+      - name: Build and inspect Debian application package
+        working-directory: bench/tests/helloworld
+        env:
+          CLI_PATH: ${{ steps.extract-cli.outputs.path }}
+          CLI_TARGET: ${{ matrix.cli_target }}
+        run: |
+          set -euo pipefail
+          evidence_dir="$RUNNER_TEMP/tauri-arm64-app-$CLI_TARGET"
+          mkdir -p "$evidence_dir"
+          bash "$GITHUB_WORKSPACE/.scripts/ci/verify-cli-linux-arm64-app.sh" \
+            "$CLI_PATH" "$CLI_TARGET" 2>&1 | tee "$evidence_dir/validation.log"
+
+      - name: Upload application package and validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arm64-app-validation-${{ matrix.cli_target }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/tauri-arm64-app-${{ matrix.cli_target }}/**
           if-no-files-found: warn
