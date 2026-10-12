@@ -1,0 +1,176 @@
+# Fork-only validation workflow. Keep this file out of the production PR.
+name: verify standalone Linux ARM64 CLI
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ci/68-linux-arm64
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - rust_target: aarch64-unknown-linux-gnu
+            ext: ""
+            args: ""
+            cross: true
+          - rust_target: aarch64-unknown-linux-musl
+            ext: ""
+            args: ""
+            cross: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install cross
+        if: ${{ matrix.config.cross }}
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross@0.2.5
+
+      - name: Build CLI (cross)
+        if: ${{ matrix.config.cross }}
+        env:
+          RUST_TARGET: ${{ matrix.config.rust_target }}
+          BUILD_ARGS: ${{ matrix.config.args }}
+        run: >-
+          cross build --manifest-path ./crates/tauri-cli/Cargo.toml
+          --target "$RUST_TARGET"
+          --profile release-size-optimized
+          $BUILD_ARGS
+
+      - name: Package CLI
+        env:
+          RUST_TARGET: ${{ matrix.config.rust_target }}
+        run: |
+          mkdir -p "outputs/cargo-tauri-${RUST_TARGET}"
+          cp "target/${RUST_TARGET}/release-size-optimized/cargo-tauri" \
+            "outputs/cargo-tauri-${RUST_TARGET}/cargo-tauri"
+          ./.scripts/ci/pack-cli.sh
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-tauri-${{ matrix.config.rust_target }}
+          path: outputs/cargo-tauri-${{ matrix.config.rust_target }}.tgz
+          if-no-files-found: error
+
+  smoke:
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Read CLI version
+        id: cli-version
+        run: |
+          version="$(jq -r '."cli.js".version' crates/tauri-cli/metadata-v2.json)"
+          test -n "$version" && test "$version" != null
+          printf 'value=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+      - name: Download GNU archive
+        uses: actions/download-artifact@v4
+        with:
+          name: cargo-tauri-aarch64-unknown-linux-gnu
+          path: artifacts/gnu
+
+      - name: Download musl archive
+        uses: actions/download-artifact@v4
+        with:
+          name: cargo-tauri-aarch64-unknown-linux-musl
+          path: artifacts/musl
+
+      - name: Inspect and extract archives
+        env:
+          CLI_VERSION: ${{ steps.cli-version.outputs.value }}
+        run: |
+          set -euo pipefail
+          mkdir -p smoke/gnu smoke/musl
+          gnu_archive='artifacts/gnu/cargo-tauri-aarch64-unknown-linux-gnu.tgz'
+          musl_archive='artifacts/musl/cargo-tauri-aarch64-unknown-linux-musl.tgz'
+          test "$(basename "$gnu_archive")" = cargo-tauri-aarch64-unknown-linux-gnu.tgz
+          test "$(basename "$musl_archive")" = cargo-tauri-aarch64-unknown-linux-musl.tgz
+          for archive in "$gnu_archive" "$musl_archive"; do
+            tar -tzf "$archive" | tee -a smoke/archive-contents.txt
+            tar -tzf "$archive" | grep -Fxq cargo-tauri
+          done
+          tar -xzf "$gnu_archive" -C smoke/gnu
+          tar -xzf "$musl_archive" -C smoke/musl
+          for target in gnu musl; do
+            readelf -h "smoke/${target}/cargo-tauri" | tee "smoke/${target}-elf-header.txt"
+            readelf -h "smoke/${target}/cargo-tauri" | grep -Eq 'Class:[[:space:]]+ELF64'
+            readelf -h "smoke/${target}/cargo-tauri" | grep -Eq 'Machine:[[:space:]]+AArch64'
+          done
+          readelf --version-info smoke/gnu/cargo-tauri | tee smoke/gnu-version-info.txt
+          required_glibc="$(grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' smoke/gnu-version-info.txt | cut -d_ -f2 | sort -Vu)"
+          test -n "$required_glibc"
+          max_glibc="$(printf '%s\n' "$required_glibc" | sort -V | tail -n 1)"
+          printf 'Maximum required GLIBC version: %s\n' "$max_glibc" | tee smoke/glibc-floor.txt
+          if [ "$(printf '%s\n' "$max_glibc" 2.35 | sort -V | tail -n 1)" != 2.35 ]; then
+            echo "GNU binary requires GLIBC newer than 2.35" >&2
+            exit 1
+          fi
+          if readelf -d smoke/gnu/cargo-tauri | grep -Fq 'Shared library: [libgtk-3.so.0]'; then
+            echo true > smoke/install-gtk.txt
+          else
+            echo false > smoke/install-gtk.txt
+          fi
+          printf 'CLI version from manifest: %s\n' "$CLI_VERSION" | tee smoke/manifest-version.txt
+
+      - name: Smoke-test GNU binary in Ubuntu 22.04 ARM64
+        env:
+          CLI_VERSION: ${{ steps.cli-version.outputs.value }}
+        run: |
+          set -euo pipefail
+          install_gtk="$(cat smoke/install-gtk.txt)"
+          docker run --rm --platform linux/arm64 \
+            -e "CLI_VERSION=${CLI_VERSION}" -e "INSTALL_GTK=${install_gtk}" \
+            -v "$PWD/smoke/gnu:/work:ro" ubuntu:22.04 bash -euxo pipefail -c '
+              if [ "$INSTALL_GTK" = true ]; then
+                apt-get update
+                apt-get install -y --no-install-recommends libgtk-3-0
+              fi
+              ldd /work/cargo-tauri | tee /tmp/cargo-tauri-ldd.txt
+              if grep -q "not found" /tmp/cargo-tauri-ldd.txt; then
+                echo "Unresolved GNU runtime dependency; inspect ldd evidence above" >&2
+                exit 1
+              fi
+              version_output="$(/work/cargo-tauri --version)"
+              printf "%s\\n" "$version_output"
+              [[ "$version_output" == *"$CLI_VERSION"* ]]
+              /work/cargo-tauri --help
+            ' 2>&1 | tee smoke/gnu-runtime.log
+
+      - name: Smoke-test musl binary in ARM64 Alpine
+        env:
+          CLI_VERSION: ${{ steps.cli-version.outputs.value }}
+        run: |
+          set -euo pipefail
+          docker run --rm --platform linux/arm64 \
+            -e "CLI_VERSION=${CLI_VERSION}" \
+            -v "$PWD/smoke/musl:/work:ro" alpine:latest sh -euxc '
+              version_output="$(/work/cargo-tauri --version)"
+              printf "%s\\n" "$version_output"
+              case "$version_output" in
+                *"$CLI_VERSION"*) ;;
+                *) echo "CLI version does not match manifest" >&2; exit 1 ;;
+              esac
+              /work/cargo-tauri --help
+            ' 2>&1 | tee smoke/musl-runtime.log
+
+      - name: Upload smoke evidence and archives
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arm64-cli-smoke-${{ github.run_id }}
+          path: |
+            artifacts/**/*.tgz
+            smoke/**/*.txt
+            smoke/**/*.log
+          if-no-files-found: warn
