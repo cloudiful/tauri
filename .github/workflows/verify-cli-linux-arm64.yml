@@ -18,12 +18,12 @@ jobs:
       matrix:
         config:
           - rust_target: aarch64-unknown-linux-gnu
-            ext: ""
-            args: ""
+            ext: ''
+            args: ''
             cross: true
           - rust_target: aarch64-unknown-linux-musl
-            ext: ""
-            args: ""
+            ext: ''
+            args: ''
             cross: true
     steps:
       - uses: actions/checkout@v7
